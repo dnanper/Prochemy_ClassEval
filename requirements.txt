@@ -1,0 +1,27 @@
+# Core dependencies
+tqdm>=4.66.0
+func-timeout>=4.3.5
+
+# API clients
+openai>=1.0.0
+google-generativeai>=0.3.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Optional: For HuggingFace models (uncomment if needed)
+# torch>=2.0.0
+# transformers>=4.30.0
+
+# Standard library (included in Python, listed for reference)
+# os
+# re
+# json
+# random
+# subprocess
+# concurrent.futures
+# unittest
+# importlib
+# shutil
+# sys
+# gzip
