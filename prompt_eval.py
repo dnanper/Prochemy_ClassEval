@@ -8,6 +8,7 @@ import json
 import shutil
 import sys
 from func_timeout import func_set_timeout
+import func_timeout
 import importlib
 import unittest
 import torch
@@ -498,7 +499,8 @@ def _extract_method_code_inference_util(code, method_name):
     EXACT implementation of InferenceUtil.extract_method_code()
     """
     # Extract code from response markers
-    output_split_identifier_list = ["### Response:", "@@ Response:", "[/INST]"]
+    # output_split_identifier_list = ["### Response:", "@@ Response:", "[/INST]"]
+    output_split_identifier_list = ['assistant\n']
     for identifier in output_split_identifier_list:
         if identifier in code:
             code = code.split(identifier)[1]
@@ -597,6 +599,7 @@ def _gen_hf(task_describe, prompts, model, tokenizer, use_chat_template = True):
         truncation=True,
         max_length=12288
     ).to(model.device)
+    # input_ids = tokenizer()
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -612,12 +615,13 @@ def _gen_hf(task_describe, prompts, model, tokenizer, use_chat_template = True):
         full_text = tokenizer.decode(output, skip_special_tokens=True)
         print("Full Text: ", full_text)
         response_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        results.append(response_text)
         # print("Response Text: ", response_text)
-        match = re.search(r'```(?:python)?(.*?)```', full_text, re.DOTALL)
-        if match:
-            results.append(match.group(1).strip())
-        else:
-            results.append(response_text)
+        # match = re.search(r'```(?:python)?(.*?)```', full_text, re.DOTALL)
+        # if match:
+        #     results.append(match.group(1).strip())
+        # else:
+        #     results.append(response_text)
     return results
 
 
@@ -680,8 +684,9 @@ def _gen_compositional_hf(task_describe, prompt, model, tokenizer, use_chat_temp
 def _gen_function_only_hf(task_describe, prompt, model, tokenizer, use_chat_template=True):
     """
     Generate code function-only using HuggingFace model: generate each method from docstring only (no skeleton).
-    Similar to _gen_function_only but uses HF model instead of API.
+    Returns list of method records for method-level evaluation.
     """
+    task_id = prompt.get('task_id')
     class_name = prompt['class_name']
     methods_info = prompt.get('methods_info', [])
     imports = prompt.get('import_statement', [])
@@ -706,27 +711,55 @@ def _gen_function_only_hf(task_describe, prompt, model, tokenizer, use_chat_temp
     # Generate all methods using HF batch generation
     method_completions = _gen_hf(task_describe, method_prompts, model, tokenizer, use_chat_template)
     
-    # Post-process: combine all methods into final class
-    imports_text = '\n'.join(imports)
-    class_init = _add_desc_to_init(class_description, class_constructor)
-    final_class_code = imports_text + '\n' + class_init
+    # Post-process: create method-level records
+    # Each record contains generated method + ground truth other methods
+    method_records = []
     
     for i in range(len(method_completions)):
-        method_name = methods_info[i]['method_name']
+        current_method_name = methods_info[i]['method_name']
         raw_output = method_completions[i]
-        # Extract method code
-        method_code = _extract_method_code_inference_util(raw_output, method_name)
-        final_class_code += '\n\n' + method_code
+        
+        # Extract generated method code
+        generated_method_code = _extract_method_code_inference_util(raw_output, current_method_name)
+        
+        # Build class code: imports + constructor + all methods
+        class_code = imports_text + '\n' + class_init
+        
+        for method_info in methods_info:
+            if method_info['method_name'] == current_method_name:
+                # Use generated method
+                class_code += '\n\n' + generated_method_code
+            else:
+                # Use ground truth method
+                if 'solution_code' in method_info:
+                    class_code += '\n\n' + method_info['solution_code']
+                else:
+                    # Fallback: signature + pass
+                    method_sig = _get_method_signature_from_description(
+                        method_info['method_description'], 
+                        method_info['method_name']
+                    )
+                    class_code += '\n\n' + method_sig + '\n        pass'
+        
+        # Create method record
+        method_records.append({
+            'task_id': task_id,
+            'class_name': class_name,
+            'method_name': current_method_name,
+            'prediction': generated_method_code,
+            'class_code': class_code
+        })
     
-    return final_class_code
+    return method_records
 
 
 def _gen_full_context_hf(task_describe, prompt, model, tokenizer, use_chat_template=True):
     """
     Generate code with full context using HuggingFace model: provide full implementation of other methods,
     only hide the body of the target method to generate.
-    This strategy gives maximum context to the model.
+    Returns list of method records for method-level evaluation.
     """
+    task_id = prompt.get('task_id')
     class_name = prompt['class_name']
     methods_info = prompt.get('methods_info', [])
     imports = prompt.get('import_statement', [])
@@ -747,13 +780,7 @@ def _gen_full_context_hf(task_describe, prompt, model, tokenizer, use_chat_templ
         for method in methods_info:
             if method['method_name'] == method_to_generate['method_name']:
                 # Target method: only add signature + description, no body
-                method_signature = _get_method_signature_from_description(
-                    method['method_description'], 
-                    method['method_name']
-                )
-                class_text += '\n\n' + method_signature
-                class_text += '\n        """' + method['method_description'].split('"""')[1].split('"""')[0] + '"""'
-                class_text += '\n        # TODO: Complete this method'
+                continue
             else:
                 # Other methods: add full implementation from solution_code
                 if 'solution_code' in method:
@@ -765,29 +792,57 @@ def _gen_full_context_hf(task_describe, prompt, model, tokenizer, use_chat_templ
                         method['method_name']
                     )
                     class_text += '\n\n' + method_signature + "\n        pass"
+        class_text += '\n\n' + method_to_generate['method_description']
         
         # Construct prompt
         method_name = method_to_generate['method_name']
-        inst = f"Please complete the method {method_name} in the following class {class_name}. The other methods are already implemented for your reference:\n\n"
+        inst = f"Please complete the method {method_name} in the following class {class_name}\n\n"
         
         method_prompts.append(inst + class_text)
     
     # Generate all methods using HF batch generation
     method_completions = _gen_hf(task_describe, method_prompts, model, tokenizer, use_chat_template)
     
-    # Post-process: combine all methods into final class
-    imports_text = '\n'.join(imports)
-    class_init = _add_desc_to_init(class_description, class_constructor)
-    final_class_code = imports_text + '\n' + class_init
+    # Post-process: create method-level records
+    # Each record contains generated method + ground truth other methods
+    method_records = []
     
     for i in range(len(method_completions)):
-        method_name = methods_info[i]['method_name']
+        current_method_name = methods_info[i]['method_name']
         raw_output = method_completions[i]
-        # Extract method code
-        method_code = _extract_method_code_inference_util(raw_output, method_name)
-        final_class_code += '\n\n' + method_code
+        
+        # Extract generated method code
+        generated_method_code = _extract_method_code_inference_util(raw_output, current_method_name)
+        
+        # Build class code: imports + constructor + all methods
+        class_code = imports_text + '\n' + class_init
+        
+        for method_info in methods_info:
+            if method_info['method_name'] == current_method_name:
+                # Use generated method
+                class_code += '\n\n' + generated_method_code
+            else:
+                # Use ground truth method
+                if 'solution_code' in method_info:
+                    class_code += '\n\n' + method_info['solution_code']
+                else:
+                    # Fallback: signature + pass
+                    method_sig = _get_method_signature_from_description(
+                        method_info['method_description'], 
+                        method_info['method_name']
+                    )
+                    class_code += '\n\n' + method_sig + '\n        pass'
+        
+        # Create method record
+        method_records.append({
+            'task_id': task_id,
+            'class_name': class_name,
+            'method_name': current_method_name,
+            'prediction': generated_method_code,
+            'class_code': class_code
+        })
     
-    return final_class_code
+    return method_records
 
 
 # Generate solutions and save to the specified directory
@@ -826,6 +881,7 @@ def generate_solutions(test_set_path, mutated_prompt_path, output_directory, mod
         if strategy == "compositional":
             # For compositional, need full task info including methods_info
             task_prompts = [{
+                'task_id': task["task_id"],
                 'class_name': task["class_name"],
                 'skeleton': task["skeleton"],
                 'methods_info': task.get("methods_info", []),
@@ -833,18 +889,10 @@ def generate_solutions(test_set_path, mutated_prompt_path, output_directory, mod
                 'class_constructor': task.get("class_constructor", ""),
                 'class_description': task.get("class_description", "")
             } for task in all_tasks]
-        elif strategy == "function-only":
-            # For function-only, need methods_info but no skeleton
+        elif strategy == "function-only" or strategy == "full-context":
+            # For function-only/full-context, need methods_info with solution_code
             task_prompts = [{
-                'class_name': task["class_name"],
-                'methods_info': task.get("methods_info", []),
-                'import_statement': task.get("import_statement", []),
-                'class_constructor': task.get("class_constructor", ""),
-                'class_description': task.get("class_description", "")
-            } for task in all_tasks]
-        elif strategy == "full-context":
-            # For full-context, need methods_info with solution_code
-            task_prompts = [{
+                'task_id': task["task_id"],
                 'class_name': task["class_name"],
                 'methods_info': task.get("methods_info", []),
                 'import_statement': task.get("import_statement", []),
@@ -853,7 +901,11 @@ def generate_solutions(test_set_path, mutated_prompt_path, output_directory, mod
             } for task in all_tasks]
         else:
             # For holistic, just need class_name and skeleton
-            task_prompts = [{'class_name': task["class_name"], 'skeleton': task["skeleton"]} for task in all_tasks]
+            task_prompts = [{
+                'task_id': task["task_id"],
+                'class_name': task["class_name"], 
+                'skeleton': task["skeleton"]
+            } for task in all_tasks]
         
         completions = GEN_SOLUTION(
             task_describe,
@@ -864,24 +916,32 @@ def generate_solutions(test_set_path, mutated_prompt_path, output_directory, mod
             batch_size=batch_size,
             strategy=strategy,
         )
+        
         samples = []
-        dummy = "dummy"
-        for task, completion in zip(all_tasks, completions):
-            # print("XXXXXXXXXXXXXXX")
-            # print(task["prompt"])
-            # print("<-->  Generated: ")
-            # print(completion)
-            if completion:
-                samples.append({
-                    'task_id': task['task_id'],
-                    'completion': completion
-                })
-            else:
-                print(f"No valid completion for task_id: {task['task_id']}")
-                samples.append({
-                    'task_id': task['task_id'],
-                    'completion': dummy
-                })
+        
+        # Handle different output formats based on strategy
+        if strategy == "function-only" or strategy == "full-context":
+            # Method-level output: list of method records
+            for completion in completions:
+                if isinstance(completion, list):
+                    # Each completion is a list of method records
+                    samples.extend(completion)
+                else:
+                    print(f"Warning: Expected list of method records, got {type(completion)}")
+        else:
+            # Class-level output: one completion per task
+            for task, completion in zip(all_tasks, completions):
+                if completion:
+                    samples.append({
+                        'task_id': task['task_id'],
+                        'completion': completion
+                    })
+                else:
+                    print(f"No valid completion for task_id: {task['task_id']}")
+                    samples.append({
+                        'task_id': task['task_id'],
+                        'completion': 'dummy'
+                    })
     
         # Create safe model name from model identifier
         if isinstance(tokenizer_or_name, str):
@@ -889,28 +949,35 @@ def generate_solutions(test_set_path, mutated_prompt_path, output_directory, mod
         else:
             model_name_safe = "model"
         
-        output_file = os.path.join(
-            output_directory, 
-            f"train_set_{model_name_safe}_{prompt_id}.jsonl"
-        )
+        # Choose output filename based on strategy
+        if strategy == "function-only" or strategy == "full-context":
+            output_file = os.path.join(
+                output_directory, 
+                f"method_level_{model_name_safe}_{prompt_id}.jsonl"
+            )
+            print(f"Saved {len(samples)} method records to {output_file}")
+        else:
+            output_file = os.path.join(
+                output_directory, 
+                f"train_set_{model_name_safe}_{prompt_id}.jsonl"
+            )
+            print(f"Saved {len(samples)}/{len(all_tasks)} samples to {output_file}")
+        
         write_jsonl(output_file, samples)
-        print(f"Saved {len(samples)}/{len(all_tasks)} samples to {output_file}")
 
 # Evaluate the generated solutions and select the best prompts
-def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file_path, best_prompt_output_path):
+def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file_path, best_prompt_output_path, strategy="holistic"):
     """
     Evaluate generated solutions using unittest and select the best prompts based on test results.
-    This function now uses AutoTest from test_pipeline.py for consistent evaluation logic.
     
     Args:
-        output_folder: folder containing generated solution files (train_set_{model}_{prompt_id}.jsonl)
+        output_folder: folder containing generated solution files
         train_set_path: path to train_set.json (format similar to ClassEval_data.json)
         prompts_file_path: path to mutated_prompts file
         best_prompt_output_path: path to save the best prompts
+        strategy: "holistic"/"compositional" (class-level) or "function-only"/"full-context" (method-level)
     """
     # Initialize AutoTest with train_set data
-    # AutoTest expects filename without extension (PathUtil.eval_data adds .json)
-    # Extract filename from path: "path/to/ClassEval_data.json" -> "ClassEval_data"
     train_set_name = os.path.splitext(os.path.basename(train_set_path))[0]
     auto_test = AutoTest(train_set_name)
     
@@ -918,7 +985,7 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
     prompt_results = {}
     
     print(f"\n{'='*60}")
-    print("Starting evaluation of generated solutions...")
+    print(f"Starting evaluation of generated solutions (strategy: {strategy})...")
     print(f"{'='*60}\n")
     
     # Change to output_folder for test execution
@@ -935,7 +1002,7 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
             if not filename.endswith(".jsonl"):
                 continue
                 
-            # Extract prompt_id from filename (e.g., train_set_model_123.jsonl -> 123)
+            # Extract prompt_id from filename
             try:
                 prompt_id = int(re.search(r'_(\d+)\.jsonl$', filename).group(1))
             except (IndexError, ValueError, AttributeError):
@@ -948,56 +1015,33 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
             
             jsonl_file_path = os.path.join(output_folder, filename)
             
-            # Read completions from jsonl file
-            code_list = {}
-            with open(jsonl_file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        item = json.loads(line)
-                        task_id = item['task_id']
-                        completion = item['completion']
-                        
-                        # Prepare code with imports (same as test_pipeline.py logic)
-                        if task_id in auto_test.eval_data:
-                            full_code = '\n'.join(auto_test.eval_data[task_id]['import_statement']) + '\n' + completion
-                            code_list[task_id] = [full_code]  # List of 1 code per task
-                    except json.JSONDecodeError:
-                        continue
-            
-            # Generate test files for all tasks (reusing test_pipeline logic)
-            for task_id in code_list:
-                test_code = auto_test.eval_data[task_id]['test']
-                task_code_list = code_list[task_id]
-                auto_test.gen_py_file(f"{task_id}_prompt_{prompt_id}", task_code_list, test_code)
-            
-            # Run tests for each task (reusing test_pipeline logic)
-            all_test_results = {}
-            for task_id in tqdm(code_list, desc=f"Testing prompt {prompt_id}"):
-                try:
-                    test_result = auto_test.test(
-                        len(code_list[task_id]), 
-                        f"{task_id}_prompt_{prompt_id}",
-                        auto_test.eval_data[task_id]['test_classes'], 
-                        f"prompt_{prompt_id}"
-                    )
-                    all_test_results[task_id] = test_result
-                    
-                except Exception as e:
-                    print(f"Error testing {task_id}: {e}")
-                    all_test_results[task_id] = {}
-            
-            # Process results using the same logic as test_pipeline.evaluate()
-            evaluated_results = _evaluate_prompt_results(all_test_results, auto_test)
-            
-            # Calculate metrics using the EXACT same logic as cal_metrics_pass_at_k
-            # but inline to avoid file I/O issues
-            prompt_results[prompt_id] = _calculate_metrics(evaluated_results, auto_test)
-            
-            print(f"\nPrompt {prompt_id} Results:")
-            print(f"  Function Success Rate: {prompt_results[prompt_id]['fun_success']:.2%}")
-            print(f"  Class Success Rate: {prompt_results[prompt_id]['class_success']:.2%}")
-            print(f"  Function Partial Success Rate: {prompt_results[prompt_id]['fun_partial_success']:.2%}")
-            print(f"  Class Partial Success Rate: {prompt_results[prompt_id]['class_partial_success']:.2%}")
+            # Branch logic based on strategy
+            if strategy == "function-only" or strategy == "full-context":
+                # Method-level evaluation (custom_test_pipeline logic)
+                all_test_results = _evaluate_method_level(
+                    jsonl_file_path, prompt_id, auto_test
+                )
+                prompt_results[prompt_id] = _calculate_method_metrics(all_test_results, auto_test)
+                
+                print(f"\nPrompt {prompt_id} Results (Method-Level):")
+                print(f"  Total Methods: {prompt_results[prompt_id]['total_methods']}")
+                print(f"  Success: {prompt_results[prompt_id]['success_count']} ({prompt_results[prompt_id]['success_rate']:.2%})")
+                print(f"  Partial Success: {prompt_results[prompt_id]['partial_success_count']} ({prompt_results[prompt_id]['partial_success_rate']:.2%})")
+                print(f"  Fail: {prompt_results[prompt_id]['fail_count']} ({prompt_results[prompt_id]['fail_rate']:.2%})")
+                print(f"  Error: {prompt_results[prompt_id]['error_count']} ({prompt_results[prompt_id]['error_rate']:.2%})")
+            else:
+                # Class-level evaluation (original logic)
+                all_test_results = _evaluate_class_level(
+                    jsonl_file_path, prompt_id, auto_test
+                )
+                evaluated_results = _evaluate_prompt_results(all_test_results, auto_test)
+                prompt_results[prompt_id] = _calculate_metrics(evaluated_results, auto_test)
+                
+                print(f"\nPrompt {prompt_id} Results (Class-Level):")
+                print(f"  Function Success Rate: {prompt_results[prompt_id]['fun_success']:.2%}")
+                print(f"  Class Success Rate: {prompt_results[prompt_id]['class_success']:.2%}")
+                print(f"  Function Partial Success Rate: {prompt_results[prompt_id]['fun_partial_success']:.2%}")
+                print(f"  Class Partial Success Rate: {prompt_results[prompt_id]['class_partial_success']:.2%}")
             
             # Clean up test files for this prompt
             _cleanup_test_files(output_folder, prompt_id)
@@ -1013,12 +1057,19 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
         print("\nNo valid results found!")
         return
     
-    # Calculate combined score using formula: 0.4*fun_success + 0.6*class_success
-    # Using the metrics directly from cal_metrics_pass_at_k()
-    for prompt_id in prompt_results:
-        fun_success = prompt_results[prompt_id]['fun_success']
-        class_success = prompt_results[prompt_id]['class_success']
-        prompt_results[prompt_id]['combined_score'] = 0.4 * fun_success + 0.6 * class_success
+    # Calculate combined score based on strategy
+    if strategy == "function-only" or strategy == "full-context":
+        # Method-level: only function success + partial success
+        for prompt_id in prompt_results:
+            success_rate = prompt_results[prompt_id]['success_rate']
+            partial_rate = prompt_results[prompt_id]['partial_success_rate']
+            prompt_results[prompt_id]['combined_score'] = 0.7 * success_rate + 0.3 * partial_rate
+    else:
+        # Class-level: weighted by function and class
+        for prompt_id in prompt_results:
+            fun_success = prompt_results[prompt_id]['fun_success']
+            class_success = prompt_results[prompt_id]['class_success']
+            prompt_results[prompt_id]['combined_score'] = 0.4 * fun_success + 0.6 * class_success
     
     # Find best prompt(s) - top 3 by combined score
     sorted_prompts = sorted(prompt_results.items(), key=lambda x: x[1]['combined_score'], reverse=True)
@@ -1032,10 +1083,15 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
     for prompt_id in sorted(prompt_results.keys()):
         r = prompt_results[prompt_id]
         print(f"\nPrompt ID: {prompt_id}")
-        print(f"  Function Success: {r['fun_success']:.2%}")
-        print(f"  Class Success: {r['class_success']:.2%}")
-        print(f"  Function Partial Success: {r['fun_partial_success']:.2%}")
-        print(f"  Class Partial Success: {r['class_partial_success']:.2%}")
+        if strategy == "function-only" or strategy == "full-context":
+            print(f"  Total Methods: {r['total_methods']}")
+            print(f"  Success Rate: {r['success_rate']:.2%}")
+            print(f"  Partial Success Rate: {r['partial_success_rate']:.2%}")
+        else:
+            print(f"  Function Success: {r['fun_success']:.2%}")
+            print(f"  Class Success: {r['class_success']:.2%}")
+            print(f"  Function Partial Success: {r['fun_partial_success']:.2%}")
+            print(f"  Class Partial Success: {r['class_partial_success']:.2%}")
         print(f"  Combined Score: {r['combined_score']:.4f}")
     
     print(f"\n{'='*60}")
@@ -1066,6 +1122,170 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
     with open(results_path, 'w', encoding='utf-8') as f:
         json.dump(prompt_results, f, indent=2, ensure_ascii=False)
     print(f"Detailed results saved to: {results_path}")
+
+
+def _evaluate_method_level(jsonl_file_path, prompt_id, auto_test):
+    """
+    Evaluate method-level output (function-only/full-context).
+    Based on custom_test_pipeline.py logic.
+    
+    Returns: dict {task_id_methodname: {test_class: {errors, failures, testsRun}}}
+    """
+    result_dict = {}
+    
+    # Read method records from JSONL
+    task_list = []
+    with open(jsonl_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                task_list.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    
+    # Generate python test files
+    for task in task_list:
+        task_id = task['task_id']
+        method_name = task['method_name']
+        class_code = task['class_code']
+        
+        # Build test code
+        test_code = "import unittest"
+        for method in auto_test.eval_data[task_id]['methods_info']:
+            if method['method_name'] == method_name:
+                test_code += '\\n\\n' + method['test_code']
+                break
+        
+        # Generate .py file
+        test_name = f"{task_id}_{method_name}_prompt_{prompt_id}.py"
+        test_code_py = class_code + '\\n' + test_code
+        with open(test_name, 'w', encoding='utf-8') as f:
+            f.write(test_code_py)
+    
+    # Run unit tests
+    for task in tqdm(task_list, desc=f"Testing prompt {prompt_id} (method-level)"):
+        task_id = task['task_id']
+        method_name = task['method_name']
+        test_module_name = f"{task_id}_{method_name}_prompt_{prompt_id}"
+        result_key = f"{task_id}_{method_name}"
+        
+        # Find test_class for this method
+        test_class = None
+        for method in auto_test.eval_data[task_id]['methods_info']:
+            if method['method_name'] == method_name:
+                test_class = method['test_class']
+                break
+        
+        if not test_class:
+            continue
+        
+        try:
+            res = auto_test.run_unit_test(test_module_name, test_class, f"prompt_{prompt_id}")
+            result_dict[result_key] = {
+                test_class: {
+                    'errors': len(res.errors),
+                    'failures': len(res.failures),
+                    'testsRun': res.testsRun
+                }
+            }
+        except func_timeout.exceptions.FunctionTimedOut:
+            print(f"⏱️  TIMEOUT (30s) for {test_module_name}.{test_class}")
+            result_dict[result_key] = {
+                test_class: {'errors': 0, 'failures': 0, 'testsRun': 0}
+            }
+        except Exception as e:
+            print(f"❌ ERROR in test for {test_module_name}.{test_class}: {e}")
+            result_dict[result_key] = {
+                test_class: {'errors': 0, 'failures': 0, 'testsRun': 0}
+            }
+    
+    return result_dict
+
+
+def _calculate_method_metrics(test_results, auto_test):
+    """
+    Calculate metrics for method-level testing.
+    Based on custom_test_pipeline.cal_metrics() logic.
+    
+    Returns: dict with success_rate, partial_success_rate, fail_rate, error_rate, total_methods
+    """
+    success_count = 0
+    partial_success_count = 0
+    fail_count = 0
+    error_count = 0
+    total_count = 0
+    
+    for task_method_key in test_results:
+        for test_class in test_results[task_method_key]:
+            result = auto_test.get_test_answer(test_results[task_method_key][test_class])
+            total_count += 1
+            
+            if result == 'success':
+                success_count += 1
+            elif result == 'partial_success':
+                partial_success_count += 1
+            elif result == 'fail':
+                fail_count += 1
+            elif result == 'error':
+                error_count += 1
+    
+    return {
+        'success_rate': success_count / total_count if total_count > 0 else 0,
+        'partial_success_rate': partial_success_count / total_count if total_count > 0 else 0,
+        'fail_rate': fail_count / total_count if total_count > 0 else 0,
+        'error_rate': error_count / total_count if total_count > 0 else 0,
+        'total_methods': total_count,
+        'success_count': success_count,
+        'partial_success_count': partial_success_count,
+        'fail_count': fail_count,
+        'error_count': error_count
+    }
+
+
+def _evaluate_class_level(jsonl_file_path, prompt_id, auto_test):
+    """
+    Evaluate class-level output (holistic/compositional).
+    Based on original test_pipeline.py logic.
+    
+    Returns: dict {task_id: {test_code_name: {test_class: result_item}}}
+    """
+    # Read completions from jsonl file
+    code_list = {}
+    with open(jsonl_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                item = json.loads(line)
+                task_id = item['task_id']
+                completion = item['completion']
+                
+                # Prepare code with imports (same as test_pipeline.py logic)
+                if task_id in auto_test.eval_data:
+                    full_code = '\\n'.join(auto_test.eval_data[task_id]['import_statement']) + '\\n' + completion
+                    code_list[task_id] = [full_code]  # List of 1 code per task
+            except json.JSONDecodeError:
+                continue
+    
+    # Generate test files for all tasks
+    for task_id in code_list:
+        test_code = auto_test.eval_data[task_id]['test']
+        task_code_list = code_list[task_id]
+        auto_test.gen_py_file(f"{task_id}_prompt_{prompt_id}", task_code_list, test_code)
+    
+    # Run tests for each task
+    all_test_results = {}
+    for task_id in tqdm(code_list, desc=f"Testing prompt {prompt_id} (class-level)"):
+        try:
+            test_result = auto_test.test(
+                len(code_list[task_id]), 
+                f"{task_id}_prompt_{prompt_id}",
+                auto_test.eval_data[task_id]['test_classes'], 
+                f"prompt_{prompt_id}"
+            )
+            all_test_results[task_id] = test_result
+        except Exception as e:
+            print(f"Error testing {task_id}: {e}")
+            all_test_results[task_id] = {}
+    
+    return all_test_results
 
 
 def _calculate_metrics(evaluated_results, auto_test):
@@ -1209,3 +1429,157 @@ def _cleanup_all_test_files(directory):
                 os.remove(os.path.join(directory, file))
             except:
                     pass
+
+
+def convert_function_only_to_method_level(class_level_output_path, method_level_output_path, eval_data_path):
+    """
+    Convert function-only/full-context class-level output to method-level output.
+    Each method is combined with ground truth methods for individual evaluation.
+    
+    Args:
+        class_level_output_path: Path to class-level output JSON file (generated by function-only/full-context)
+        method_level_output_path: Path to save method-level output JSONL file
+        eval_data_path: Path to evaluation data (ClassEval_data.json) containing ground truth
+    """
+    # Load class-level predictions
+    with open(class_level_output_path, 'r', encoding='utf-8') as f:
+        class_predictions = json.load(f)
+    
+    # Load evaluation data (ground truth)
+    with open(eval_data_path, 'r', encoding='utf-8') as f:
+        eval_data = json.load(f)
+    
+    # Create lookup for eval_data by task_id
+    eval_data_dict = {item['task_id']: item for item in eval_data}
+    
+    method_records = []
+    
+    print(f"\n{'='*60}")
+    print("Converting class-level to method-level output...")
+    print(f"{'='*60}\n")
+    
+    for task_pred in tqdm(class_predictions, desc="Converting tasks"):
+        task_id = task_pred['task_id']
+        class_completion = task_pred.get('completion', '')
+        
+        if task_id not in eval_data_dict:
+            print(f"⚠️  Task {task_id} not found in eval data, skipping...")
+            continue
+        
+        task_eval = eval_data_dict[task_id]
+        methods_info = task_eval.get('methods_info', [])
+        imports = task_eval.get('import_statement', [])
+        class_constructor = task_eval.get('class_constructor', '')
+        
+        if not methods_info:
+            print(f"⚠️  No methods_info for {task_id}, skipping...")
+            continue
+        
+        # Extract generated methods from class completion
+        generated_methods = _extract_all_methods_from_class(class_completion)
+        
+        # For each method, create a record with generated method + ground truth other methods
+        for method_info in methods_info:
+            method_name = method_info['method_name']
+            
+            # Build class code: imports + constructor + methods
+            class_code = '\n'.join(imports) + '\n' + class_constructor
+            
+            # Add all methods
+            for m_info in methods_info:
+                m_name = m_info['method_name']
+                
+                if m_name == method_name:
+                    # Use generated method
+                    if method_name in generated_methods:
+                        class_code += '\n\n' + generated_methods[method_name]
+                    else:
+                        # Fallback: use signature + pass if generation failed
+                        print(f"⚠️  Generated method {method_name} not found in {task_id}, using fallback")
+                        method_sig = _get_method_signature_from_description(
+                            m_info['method_description'], method_name
+                        )
+                        class_code += '\n\n' + method_sig + '\n        pass'
+                else:
+                    # Use ground truth method
+                    if 'solution_code' in m_info:
+                        class_code += '\n\n' + m_info['solution_code']
+                    else:
+                        print(f"⚠️  No solution_code for {m_name} in {task_id}")
+                        method_sig = _get_method_signature_from_description(
+                            m_info['method_description'], m_name
+                        )
+                        class_code += '\n\n' + method_sig + '\n        pass'
+            
+            # Create method-level record
+            method_record = {
+                'task_id': task_id,
+                'class_name': task_eval['class_name'],
+                'method_name': method_name,
+                'prediction': generated_methods.get(method_name, ''),
+                'class_code': class_code
+            }
+            
+            method_records.append(method_record)
+    
+    # Save to JSONL file
+    with open(method_level_output_path, 'w', encoding='utf-8') as f:
+        for record in method_records:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+    
+    print(f"\n✅ Converted {len(method_records)} method records")
+    print(f"📁 Saved to: {method_level_output_path}")
+    
+    return method_records
+
+
+def _extract_all_methods_from_class(class_code):
+    """
+    Extract all methods from a complete class code.
+    Returns a dictionary mapping method_name -> method_code (with proper indentation).
+    """
+    methods = {}
+    
+    # Split by lines
+    lines = class_code.split('\n')
+    
+    current_method_name = None
+    current_method_lines = []
+    in_method = False
+    method_indent = None
+    
+    for line in lines:
+        # Check if this is a method definition line
+        method_match = re.match(r'^(\s*)def\s+(\w+)\s*\(', line)
+        
+        if method_match:
+            # Save previous method if exists
+            if current_method_name and current_method_lines:
+                methods[current_method_name] = '\n'.join(current_method_lines)
+            
+            # Start new method
+            method_indent = len(method_match.group(1))
+            current_method_name = method_match.group(2)
+            current_method_lines = [line]
+            in_method = True
+        elif in_method:
+            # Check if we're still in the method (indentation or blank line)
+            if line.strip() == '':
+                # Blank line - keep it if we're in a method
+                current_method_lines.append(line)
+            elif line.startswith(' ' * (method_indent + 1)) or line.strip().startswith('@'):
+                # Indented more than method definition or decorator
+                current_method_lines.append(line)
+            else:
+                # End of method (new def at same level or less indentation)
+                if current_method_name and current_method_lines:
+                    methods[current_method_name] = '\n'.join(current_method_lines)
+                current_method_name = None
+                current_method_lines = []
+                in_method = False
+    
+    # Save last method
+    if current_method_name and current_method_lines:
+        methods[current_method_name] = '\n'.join(current_method_lines)
+    
+    return methods

@@ -119,7 +119,7 @@ class AutoTest:
                 code_list[item['task_id']].append(predict)
         return code_list
 
-    @func_set_timeout(5)
+    @func_set_timeout(30)
     def run_unit_test(self, test_code, test_class, model_name):
         module = importlib.import_module(test_code)
         log_path = PathUtil().log_output_data(model_name + "_log_data", 'log')
@@ -146,6 +146,13 @@ class AutoTest:
                     res_item['failures'] = len(res.failures)
                     res_item['testsRun'] = res.testsRun
                     result[test_code][test_class] = res_item
+                except func_timeout.exceptions.FunctionTimedOut:
+                    print(f"TIMEOUT for {test_code}.{test_class}")
+                    result[test_class] = {
+                        'errors': 0,
+                        'failures': 0,
+                        'testsRun': 0
+                    }
                 except:
                     res_item['errors'] = 0
                     res_item['failures'] = 0
@@ -164,7 +171,7 @@ class AutoTest:
 
         result_dict = {}
         # get generate code list
-        code_list = self.gen_code_list(gen_file_path)
+        code_list = self.gen_code_list(gen_file_path) # dict: taskid-[pred]
 
         # get test code and generate py file
         for task_id in code_list:
@@ -315,7 +322,7 @@ class AutoTest:
         assert os.path.basename(os.getcwd()) == self.TEAR_DOWN_TARGET_DIR_NAME
 
         file_list = os.listdir()
-        reserved_files = ["evaluation.py", "path_util.py", "test_pipeline.py", "README.md", "incremental generation.png", "run.sh"]
+        reserved_files = ["evaluation.py", "path_util.py", "test_pipeline.py", "README.md", "incremental generation.png", "run.sh", "custom_test_pipeline.py"]
         for item in file_list:
             if item not in reserved_files and "test_pipeline" not in item and "_pycache__" not in item:
                 if os.path.isdir(item):

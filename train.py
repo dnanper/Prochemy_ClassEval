@@ -105,7 +105,8 @@ for gen in range(N_GENERATIONS):
         output_folder=output_directory,
         train_set_path=PROBLEM_FILE_PATH,
         prompts_file_path=current_prompt_file,
-        best_prompt_output_path=best_prompt_output_path
+        best_prompt_output_path=best_prompt_output_path,
+        strategy="full-context"
     )
 
     # Step 3: Prompt Mutation
