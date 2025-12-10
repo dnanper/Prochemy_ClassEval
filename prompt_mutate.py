@@ -33,7 +33,7 @@ def GEN_ANSWER(prompt, model_obj, tokenizer_or_name, model_type="openai", use_ch
                     full_prompt,
                     generation_config={
                         "temperature": 0.7,
-                        "max_output_tokens": 2500,
+                        "max_output_tokens": 5000,
                     }
                 )
                 print("RESPONSE: ", response)

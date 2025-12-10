@@ -34,18 +34,18 @@ def create_model(model_name, model_type=None, role="main"):
         print(f"[{role.upper()}] Using Hugging Face model: {model_name}")
 
         # Not import so not needed
-        # from transformers import AutoTokenizer, AutoModelForCausalLM
-        # import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import torch
         
-        # tokenizer = AutoTokenizer.from_pretrained(model_name)
-        # if tokenizer.eos_token:
-        #     tokenizer.pad_token = tokenizer.eos_token
-        # model = AutoModelForCausalLM.from_pretrained(
-        #     model_name,
-        #     torch_dtype=torch.float16,
-        #     device_map="auto"
-        # )
-        # return model, tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.eos_token:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        return model, tokenizer
 
 BASE_DIR = os.getcwd()
 
@@ -53,10 +53,10 @@ TEST_SET_PATH = os.path.join(BASE_DIR, "ClassEval_data.json")
 
 # file chứa thông tin như test cases, expected output, ... để đánh giá completion sinh từ GEN_SOLUTION.
 PROBLEM_FILE_PATH = os.path.join(BASE_DIR, "ClassEval_data.json")
+    
+OUTPUT_BASE_DIR = os.path.join(BASE_DIR, "infer_7b_full_context")
 
-OUTPUT_BASE_DIR = os.path.join(BASE_DIR, "outputs")
-
-initial_prompt_path = os.path.join(BASE_DIR, "origin_prompts.jsonl")
+initial_prompt_path = os.path.join(BASE_DIR, "best_prompt_7b_full_context.jsonl")
 
 if not os.path.exists(initial_prompt_path):
     print(f"Error: Initial prompt file not found: {initial_prompt_path}")
@@ -64,8 +64,8 @@ if not os.path.exists(initial_prompt_path):
     exit(1)
 current_prompt_file = initial_prompt_path
 
-MAIN_MODEL = "gemini-2.5-flash"
-MAIN_MODEL_TYPE = "gemini"
+MAIN_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
+MAIN_MODEL_TYPE = "hf"
 # MUTATE_MODEL = "gpt-4o-mini"
 # MUTATE_MODEL_TYPE = "openai"
 # MUTATE_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
@@ -87,15 +87,16 @@ for gen in range(N_GENERATIONS):
     # Step 1: Prompt Inference - Generate solutions
     print(f"\n[Step 1] Generating solutions using prompts from: {current_prompt_file}")
     output_directory = os.path.join(OUTPUT_BASE_DIR, f"gen_{gen}", "solutions")
-    # generate_solutions(
-    #     test_set_path=TEST_SET_PATH,
-    #     mutated_prompt_path=current_prompt_file,
-    #     output_directory=output_directory,
-    #     model_obj=main_model,
-    #     tokenizer_or_name=main_tokenizer,
-    #     model_type=MAIN_MODEL_TYPE,
-    #     batch_size = 1
-    # )
+    generate_solutions(
+        test_set_path=TEST_SET_PATH,
+        mutated_prompt_path=current_prompt_file,
+        output_directory=output_directory,
+        model_obj=main_model,
+        tokenizer_or_name=main_tokenizer,
+        model_type=MAIN_MODEL_TYPE,
+        batch_size=1,
+        strategy="full-context"  # Use "holistic" for entire class generation or "compositional" for method-by-method
+    )
 
     # Step 2: Prompt Evaluation (Thru Completion) and Select best prompt
     print(f"\n[Step 2] Evaluating solutions in: {output_directory}")
