@@ -12,6 +12,8 @@ import func_timeout
 import importlib
 import unittest
 import torch
+import traceback
+from collections import defaultdict
 
 from utils import read_json, write_jsonl
 from test_pipeline import AutoTest
@@ -988,7 +990,7 @@ def generate_solutions(test_set_path, mutated_prompt_path, output_directory, mod
         write_jsonl(output_file, samples)
 
 # Evaluate the generated solutions and select the best prompts
-def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file_path, best_prompt_output_path, strategy="holistic"):
+def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file_path, best_prompt_output_path, strategy="holistic", collect_feedback=False):
     """
     Evaluate generated solutions using unittest and select the best prompts based on test results.
     
@@ -998,6 +1000,10 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
         prompts_file_path: path to mutated_prompts file
         best_prompt_output_path: path to save the best prompts
         strategy: "holistic"/"compositional" (class-level) or "function-only"/"full-context" (method-level)
+        collect_feedback: if True, collect detailed feedback for mutation (Level 1 Feedback-Guided Mutation)
+    
+    Returns:
+        str: path to feedback file if collect_feedback=True, else None
     """
     # Initialize AutoTest with train_set data
     train_set_name = os.path.splitext(os.path.basename(train_set_path))[0]
@@ -1008,6 +1014,8 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
     
     print(f"\n{'='*60}")
     print(f"Starting evaluation of generated solutions (strategy: {strategy})...")
+    if collect_feedback:
+        print(f"Feedback collection: ENABLED (for feedback-guided mutation)")
     print(f"{'='*60}\n")
     
     # Change to output_folder for test execution
@@ -1039,11 +1047,21 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
             
             # Branch logic based on strategy
             if strategy == "function-only" or strategy == "full-context":
-                # Method-level evaluation (custom_test_pipeline logic)
-                all_test_results = _evaluate_method_level(
-                    jsonl_file_path, prompt_id, auto_test
-                )
-                prompt_results[prompt_id] = _calculate_method_metrics(all_test_results, auto_test)
+                # Method-level evaluation
+                if collect_feedback:
+                    # Use enhanced version with feedback collection
+                    all_test_results, feedback_details = _evaluate_method_level_with_feedback(
+                        jsonl_file_path, prompt_id, auto_test
+                    )
+                    prompt_results[prompt_id] = _calculate_method_metrics_with_feedback(
+                        all_test_results, feedback_details, auto_test
+                    )
+                else:
+                    # Original version without feedback
+                    all_test_results = _evaluate_method_level(
+                        jsonl_file_path, prompt_id, auto_test
+                    )
+                    prompt_results[prompt_id] = _calculate_method_metrics(all_test_results, auto_test)
                 
                 print(f"\nPrompt {prompt_id} Results (Method-Level):")
                 print(f"  Total Methods: {prompt_results[prompt_id]['total_methods']}")
@@ -1051,8 +1069,15 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
                 print(f"  Partial Success: {prompt_results[prompt_id]['partial_success_count']} ({prompt_results[prompt_id]['partial_success_rate']:.2%})")
                 print(f"  Fail: {prompt_results[prompt_id]['fail_count']} ({prompt_results[prompt_id]['fail_rate']:.2%})")
                 print(f"  Error: {prompt_results[prompt_id]['error_count']} ({prompt_results[prompt_id]['error_rate']:.2%})")
+                
+                # Print feedback summary if collected
+                if collect_feedback and 'feedback' in prompt_results[prompt_id]:
+                    fb = prompt_results[prompt_id]['feedback']
+                    top_errors = fb.get('top_error_patterns', [])[:3]
+                    if top_errors:
+                        print(f"  Top Errors: {', '.join([f'{p}({c})' for p, c in top_errors])}")
             else:
-                # Class-level evaluation (original logic)
+                # Class-level evaluation (original logic - no feedback for now)
                 all_test_results = _evaluate_class_level(
                     jsonl_file_path, prompt_id, auto_test
                 )
@@ -1077,7 +1102,7 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
     # Select best prompts based on combined metric
     if not prompt_results:
         print("\nNo valid results found!")
-        return
+        return None
     
     # Calculate combined score based on strategy
     if strategy == "function-only" or strategy == "full-context":
@@ -1095,7 +1120,7 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
     
     # Find best prompt(s) - top 3 by combined score
     sorted_prompts = sorted(prompt_results.items(), key=lambda x: x[1]['combined_score'], reverse=True)
-    best_prompt_ids = [pid for pid, _ in sorted_prompts[:3]]  # Top 3 prompts
+    best_prompt_ids = [pid for pid, _ in sorted_prompts[:1]]  # Top 3 prompts
     max_score = sorted_prompts[0][1]['combined_score'] if sorted_prompts else 0
     
     # Print summary
@@ -1142,8 +1167,23 @@ def evaluate_and_select_best_prompts(output_folder, train_set_path, prompts_file
     # Save detailed results
     results_path = os.path.join(output_folder, 'evaluation_results.json')
     with open(results_path, 'w', encoding='utf-8') as f:
-        json.dump(prompt_results, f, indent=2, ensure_ascii=False)
+        # Convert feedback raw_feedback defaultdict to regular dict for JSON serialization
+        serializable_results = {}
+        for pid, metrics in prompt_results.items():
+            serializable_results[pid] = dict(metrics)
+            if 'feedback' in serializable_results[pid]:
+                fb = serializable_results[pid]['feedback']
+                # top_error_patterns is already a list of tuples, JSON serializable
+                # sample_failed_methods is a list of dicts, JSON serializable
+        json.dump(serializable_results, f, indent=2, ensure_ascii=False)
     print(f"Detailed results saved to: {results_path}")
+    
+    # Save feedback for mutation if requested
+    feedback_path = None
+    if collect_feedback:
+        feedback_path = save_feedback_for_mutation(prompt_results, output_folder, prompts_file_path)
+    
+    return feedback_path
 
 
 def _evaluate_method_level(jsonl_file_path, prompt_id, auto_test):
@@ -1605,3 +1645,357 @@ def _extract_all_methods_from_class(class_code):
         methods[current_method_name] = '\n'.join(current_method_lines)
     
     return methods
+
+
+# ============================================================================
+# FEEDBACK COLLECTION FUNCTIONS FOR FEEDBACK-GUIDED MUTATION (Level 1)
+# ============================================================================
+
+def _evaluate_method_level_with_feedback(jsonl_file_path, prompt_id, auto_test):
+    """
+    Enhanced version of _evaluate_method_level that also captures error messages
+    for feedback-guided mutation.
+    
+    Returns: tuple (result_dict, feedback_details)
+        - result_dict: same as _evaluate_method_level
+        - feedback_details: dict with detailed error/failure info per method
+    """
+    result_dict = {}
+    feedback_details = {
+        'failed_methods': [],       # List of {task_id, method_name, error_type, error_summary}
+        'timeout_methods': [],      # List of method names that timed out
+        'error_patterns': defaultdict(int),  # Count of error patterns
+        'success_methods': [],      # List of successful methods for reference
+    }
+    
+    # Read method records from JSONL
+    task_list = []
+    with open(jsonl_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                task_list.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    
+    # Generate python test files
+    for task in task_list:
+        task_id = task['task_id']
+        method_name = task['method_name']
+        class_code = task['class_code']
+        
+        # Build test code
+        test_code = "import unittest"
+        for method in auto_test.eval_data[task_id]['methods_info']:
+            if method['method_name'] == method_name:
+                test_code += '\n\n' + method['test_code']
+                break
+        
+        # Generate .py file
+        test_name = f"{task_id}_{method_name}_prompt_{prompt_id}.py"
+        test_code_py = class_code + '\n' + test_code
+        with open(test_name, 'w', encoding='utf-8') as f:
+            f.write(test_code_py)
+    
+    # Run unit tests and capture detailed feedback
+    for task in tqdm(task_list, desc=f"Testing prompt {prompt_id} (method-level with feedback)"):
+        task_id = task['task_id']
+        method_name = task['method_name']
+        test_module_name = f"{task_id}_{method_name}_prompt_{prompt_id}"
+        result_key = f"{task_id}_{method_name}"
+        
+        # Find test_class for this method
+        test_class = None
+        method_description = ""
+        for method in auto_test.eval_data[task_id]['methods_info']:
+            if method['method_name'] == method_name:
+                test_class = method['test_class']
+                method_description = method.get('method_description', '')[:200]  # First 200 chars
+                break
+        
+        if not test_class:
+            continue
+        
+        try:
+            res = auto_test.run_unit_test(test_module_name, test_class, f"prompt_{prompt_id}")
+            result_dict[result_key] = {
+                test_class: {
+                    'errors': len(res.errors),
+                    'failures': len(res.failures),
+                    'testsRun': res.testsRun
+                }
+            }
+            
+            # Capture feedback details
+            test_answer = auto_test.get_test_answer(result_dict[result_key][test_class])
+            
+            if test_answer == 'success':
+                feedback_details['success_methods'].append({
+                    'task_id': task_id,
+                    'method_name': method_name
+                })
+            elif test_answer in ['fail', 'partial_success']:
+                # Extract error summaries
+                error_summaries = []
+                
+                # Process failures (assertion errors)
+                for test_case, traceback_str in res.failures:
+                    error_summary = _extract_error_summary(traceback_str, 'AssertionError')
+                    error_summaries.append(error_summary)
+                    feedback_details['error_patterns'][error_summary['pattern']] += 1
+                
+                # Process errors (exceptions)
+                for test_case, traceback_str in res.errors:
+                    error_summary = _extract_error_summary(traceback_str, 'Exception')
+                    error_summaries.append(error_summary)
+                    feedback_details['error_patterns'][error_summary['pattern']] += 1
+                
+                feedback_details['failed_methods'].append({
+                    'task_id': task_id,
+                    'method_name': method_name,
+                    'method_hint': method_description,
+                    'test_result': test_answer,
+                    'tests_passed': res.testsRun - len(res.errors) - len(res.failures),
+                    'tests_total': res.testsRun,
+                    'error_summaries': error_summaries[:3]  # Keep first 3 errors
+                })
+            elif test_answer == 'error':
+                # All tests errored
+                error_summaries = []
+                for test_case, traceback_str in res.errors:
+                    error_summary = _extract_error_summary(traceback_str, 'Exception')
+                    error_summaries.append(error_summary)
+                    feedback_details['error_patterns'][error_summary['pattern']] += 1
+                
+                feedback_details['failed_methods'].append({
+                    'task_id': task_id,
+                    'method_name': method_name,
+                    'method_hint': method_description,
+                    'test_result': 'error',
+                    'tests_passed': 0,
+                    'tests_total': res.testsRun,
+                    'error_summaries': error_summaries[:3]
+                })
+                
+        except func_timeout.exceptions.FunctionTimedOut:
+            print(f"⏱️  TIMEOUT (30s) for {test_module_name}.{test_class}")
+            result_dict[result_key] = {
+                test_class: {'errors': 0, 'failures': 0, 'testsRun': 0}
+            }
+            feedback_details['timeout_methods'].append({
+                'task_id': task_id,
+                'method_name': method_name,
+                'method_hint': method_description
+            })
+            feedback_details['error_patterns']['TIMEOUT'] += 1
+            
+        except Exception as e:
+            print(f"❌ ERROR in test for {test_module_name}.{test_class}: {e}")
+            result_dict[result_key] = {
+                test_class: {'errors': 0, 'failures': 0, 'testsRun': 0}
+            }
+            error_type = type(e).__name__
+            feedback_details['failed_methods'].append({
+                'task_id': task_id,
+                'method_name': method_name,
+                'method_hint': method_description,
+                'test_result': 'error',
+                'tests_passed': 0,
+                'tests_total': 0,
+                'error_summaries': [{'pattern': error_type, 'message': str(e)[:100]}]
+            })
+            feedback_details['error_patterns'][error_type] += 1
+    
+    return result_dict, feedback_details
+
+
+def _extract_error_summary(traceback_str, default_type='Exception'):
+    """
+    Extract a concise error summary from traceback string.
+    Returns: dict with 'pattern' (error type) and 'message' (short description)
+    """
+    lines = traceback_str.strip().split('\n')
+    
+    # Get the last line which usually contains the error
+    last_line = lines[-1] if lines else ""
+    
+    # Common Python error patterns
+    error_patterns = [
+        'AssertionError', 'TypeError', 'ValueError', 'AttributeError',
+        'KeyError', 'IndexError', 'ZeroDivisionError', 'NameError',
+        'RuntimeError', 'RecursionError', 'StopIteration', 'ImportError',
+        'SyntaxError', 'IndentationError', 'FileNotFoundError', 'IOError'
+    ]
+    
+    pattern = default_type
+    message = last_line[:150] if last_line else "Unknown error"
+    
+    for err_type in error_patterns:
+        if err_type in last_line:
+            pattern = err_type
+            # Extract message after the error type
+            if ':' in last_line:
+                message = last_line.split(':', 1)[-1].strip()[:150]
+            break
+    
+    # Categorize common error patterns for statistics
+    if 'empty' in message.lower() or 'none' in message.lower():
+        pattern = f"{pattern}_EMPTY_INPUT"
+    elif 'index' in message.lower() or 'out of range' in message.lower():
+        pattern = f"{pattern}_INDEX_ERROR"
+    elif 'type' in message.lower() or 'expected' in message.lower():
+        pattern = f"{pattern}_TYPE_MISMATCH"
+    
+    return {
+        'pattern': pattern,
+        'message': message
+    }
+
+
+def _calculate_method_metrics_with_feedback(test_results, feedback_details, auto_test):
+    """
+    Enhanced version of _calculate_method_metrics that includes feedback summary.
+    
+    Returns: dict with metrics + feedback summary for mutation
+    """
+    # Calculate base metrics
+    base_metrics = _calculate_method_metrics(test_results, auto_test)
+    
+    # Add feedback summary
+    base_metrics['feedback'] = {
+        'total_failed_methods': len(feedback_details['failed_methods']),
+        'total_timeout_methods': len(feedback_details['timeout_methods']),
+        'total_success_methods': len(feedback_details['success_methods']),
+        
+        # Top error patterns (sorted by frequency)
+        'top_error_patterns': sorted(
+            feedback_details['error_patterns'].items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:10],
+        
+        # Sample failed methods (for reference)
+        'sample_failed_methods': feedback_details['failed_methods'][:5],
+        
+        # Timeout patterns
+        'timeout_methods_count': len(feedback_details['timeout_methods']),
+    }
+    
+    return base_metrics
+
+
+def generate_feedback_summary(prompt_results, prompt_id):
+    """
+    Generate a human-readable feedback summary for a specific prompt.
+    This summary will be used by the mutation LLM.
+    
+    Args:
+        prompt_results: dict with metrics and feedback for a prompt
+        prompt_id: the ID of the prompt
+    
+    Returns:
+        str: Formatted feedback summary
+    """
+    r = prompt_results
+    
+    summary_parts = []
+    
+    # Overall performance
+    summary_parts.append(f"=== Prompt {prompt_id} Performance Summary ===")
+    summary_parts.append(f"Overall Success Rate: {r.get('success_rate', 0):.1%}")
+    summary_parts.append(f"Partial Success Rate: {r.get('partial_success_rate', 0):.1%}")
+    summary_parts.append(f"Failure Rate: {r.get('fail_rate', 0):.1%}")
+    summary_parts.append(f"Error Rate: {r.get('error_rate', 0):.1%}")
+    summary_parts.append(f"Total Methods Tested: {r.get('total_methods', 0)}")
+    summary_parts.append("")
+    
+    # Feedback details
+    feedback = r.get('feedback', {})
+    if feedback:
+        # Error patterns
+        top_patterns = feedback.get('top_error_patterns', [])
+        if top_patterns:
+            summary_parts.append("=== Common Error Patterns ===")
+            for pattern, count in top_patterns[:5]:
+                summary_parts.append(f"  - {pattern}: {count} occurrences")
+            summary_parts.append("")
+        
+        # Timeout issues
+        timeout_count = feedback.get('timeout_methods_count', 0)
+        if timeout_count > 0:
+            summary_parts.append(f"=== Performance Issues ===")
+            summary_parts.append(f"  - {timeout_count} methods timed out (possible infinite loops or inefficient code)")
+            summary_parts.append("")
+        
+        # Sample failures for context
+        sample_failures = feedback.get('sample_failed_methods', [])
+        if sample_failures:
+            summary_parts.append("=== Sample Failure Cases ===")
+            for failure in sample_failures[:3]:
+                method_name = failure.get('method_name', 'unknown')
+                test_result = failure.get('test_result', 'unknown')
+                tests_passed = failure.get('tests_passed', 0)
+                tests_total = failure.get('tests_total', 0)
+                error_summaries = failure.get('error_summaries', [])
+                
+                summary_parts.append(f"  Method: {method_name}")
+                summary_parts.append(f"    Result: {test_result} ({tests_passed}/{tests_total} tests passed)")
+                if error_summaries:
+                    for err in error_summaries[:2]:
+                        summary_parts.append(f"    Error: {err.get('pattern', 'Unknown')} - {err.get('message', '')[:80]}")
+                summary_parts.append("")
+    
+    return "\n".join(summary_parts)
+
+
+def save_feedback_for_mutation(prompt_results, output_folder, prompts_file_path):
+    """
+    Save feedback data in a format that can be used by prompt_mutate.py.
+    
+    This creates a feedback file that maps prompt_id to its feedback summary.
+    
+    Args:
+        prompt_results: dict mapping prompt_id to its metrics and feedback
+        output_folder: folder to save feedback file
+        prompts_file_path: path to prompts file (for looking up prompt text)
+    
+    Returns:
+        str: path to the saved feedback file
+    """
+    # Load prompt texts
+    prompt_texts = {}
+    with open(prompts_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                prompt_data = json.loads(line)
+                prompt_texts[prompt_data['prompt_id']] = prompt_data['mutated_prompt']
+            except json.JSONDecodeError:
+                continue
+    
+    # Build feedback data
+    feedback_data = []
+    for prompt_id, metrics in prompt_results.items():
+        feedback_summary = generate_feedback_summary(metrics, prompt_id)
+        
+        feedback_data.append({
+            'prompt_id': prompt_id,
+            'prompt_text': prompt_texts.get(prompt_id, ''),
+            'combined_score': metrics.get('combined_score', 0),
+            'success_rate': metrics.get('success_rate', 0),
+            'partial_success_rate': metrics.get('partial_success_rate', 0),
+            'fail_rate': metrics.get('fail_rate', 0),
+            'error_rate': metrics.get('error_rate', 0),
+            'feedback_summary': feedback_summary,
+            'raw_feedback': metrics.get('feedback', {})
+        })
+    
+    # Sort by combined_score descending
+    feedback_data.sort(key=lambda x: x['combined_score'], reverse=True)
+    
+    # Save feedback file
+    feedback_path = os.path.join(output_folder, 'mutation_feedback.jsonl')
+    with open(feedback_path, 'w', encoding='utf-8') as f:
+        for item in feedback_data:
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+    
+    print(f"Mutation feedback saved to: {feedback_path}")
+    return feedback_path
