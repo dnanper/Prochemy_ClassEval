@@ -732,7 +732,18 @@ def _gen_function_only_hf(task_describe, prompt, model, tokenizer, use_chat_temp
             else:
                 # Use ground truth method
                 if 'solution_code' in method_info:
-                    class_code += '\n\n' + method_info['solution_code']
+                    # Add 4-space indentation only to lines starting at column 0 (decorators/def)
+                    solution_lines = method_info['solution_code'].split('\n')
+                    indented_lines = []
+                    for line in solution_lines:
+                        stripped = line.strip()
+                        # Only add indent if line starts at column 0 (no leading spaces)
+                        if line and not line[0].isspace() and (stripped.startswith('def ') or stripped.startswith('@')):
+                            indented_lines.append('    ' + line)
+                        else:
+                            indented_lines.append(line)
+                    indented_solution = '\n'.join(indented_lines)
+                    class_code += '\n\n' + indented_solution
                 else:
                     # Fallback: signature + pass
                     method_sig = _get_method_signature_from_description(
@@ -824,7 +835,18 @@ def _gen_full_context_hf(task_describe, prompt, model, tokenizer, use_chat_templ
             else:
                 # Use ground truth method
                 if 'solution_code' in method_info:
-                    class_code += '\n\n' + method_info['solution_code']
+                    # Add 4-space indentation only to lines starting at column 0 (decorators/def)
+                    solution_lines = method_info['solution_code'].split('\n')
+                    indented_lines = []
+                    for line in solution_lines:
+                        stripped = line.strip()
+                        # Only add indent if line starts at column 0 (no leading spaces)
+                        if line and not line[0].isspace() and (stripped.startswith('def ') or stripped.startswith('@')):
+                            indented_lines.append('    ' + line)
+                        else:
+                            indented_lines.append(line)
+                    indented_solution = '\n'.join(indented_lines)
+                    class_code += '\n\n' + indented_solution
                 else:
                     # Fallback: signature + pass
                     method_sig = _get_method_signature_from_description(
@@ -1152,12 +1174,12 @@ def _evaluate_method_level(jsonl_file_path, prompt_id, auto_test):
         test_code = "import unittest"
         for method in auto_test.eval_data[task_id]['methods_info']:
             if method['method_name'] == method_name:
-                test_code += '\\n\\n' + method['test_code']
+                test_code += '\n\n' + method['test_code']
                 break
         
         # Generate .py file
         test_name = f"{task_id}_{method_name}_prompt_{prompt_id}.py"
-        test_code_py = class_code + '\\n' + test_code
+        test_code_py = class_code + '\n' + test_code
         with open(test_name, 'w', encoding='utf-8') as f:
             f.write(test_code_py)
     

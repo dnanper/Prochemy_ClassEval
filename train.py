@@ -110,18 +110,18 @@ for gen in range(N_GENERATIONS):
     )
 
     # Step 3: Prompt Mutation
-    # if gen < N_GENERATIONS - 1:  # Don't optimize after last generation
-    #     print(f"\n[Step 3] Optimizing prompts for next generation")
-    #     next_prompt_file = os.path.join(OUTPUT_BASE_DIR, f"gen_{gen}", "optimized_prompts.jsonl")
-    #     optimize_prompts(
-    #         input_file=best_prompt_output_path,
-    #         output_file=next_prompt_file,
-    #         model_obj=mutate_model,
-    #         tokenizer_or_name=mutate_tokenizer,
-    #         model_type=MUTATE_MODEL_TYPE,
-    #         num_new_prompts=N_NEW_PROMPTS
-    #     )
-    #     current_prompt_file = next_prompt_file
+    if gen < N_GENERATIONS - 1:  # Don't optimize after last generation
+        print(f"\n[Step 3] Optimizing prompts for next generation")
+        next_prompt_file = os.path.join(OUTPUT_BASE_DIR, f"gen_{gen}", "optimized_prompts.jsonl")
+        optimize_prompts(
+            input_file=best_prompt_output_path,
+            output_file=next_prompt_file,
+            model_obj=mutate_model,
+            tokenizer_or_name=mutate_tokenizer,
+            model_type=MUTATE_MODEL_TYPE,
+            num_new_prompts=N_NEW_PROMPTS
+        )
+        current_prompt_file = next_prompt_file
     
     print(f"\n[Generation {gen + 1}] Complete!")
 
